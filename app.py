@@ -5,6 +5,7 @@ import re
 import io
 import gspread
 from google.oauth2.service_account import Credentials
+import openpyxl
 
 # ---------------------------------------------------------
 # CONFIGURATION & PAGE SETUP
@@ -71,54 +72,108 @@ def get_gspread_client():
         st.error("Streamlit Secrets missing [gcp_service_account] or [gsheets]. Please check Settings > Secrets.")
         return None
 
-def write_worksheet_safely(spr, title, df_data):
-    try:
-        try:
-            sheet = spr.worksheet(title)
-        except gspread.exceptions.WorksheetNotFound:
-            sheet = spr.add_worksheet(
-                title=title, 
-                rows=max(len(df_data) + 50, 100), 
-                cols=max(len(df_data.columns) + 5, 15)
-            )
-        
-        clean_df = df_data.fillna("").astype(str)
-        data = [clean_df.columns.tolist()] + clean_df.values.tolist()
-        
-        required_rows = max(len(data) + 20, 100)
-        required_cols = max(len(data[0]) + 5, 15)
-        if sheet.row_count < required_rows or sheet.col_count < required_cols:
-            sheet.resize(
-                rows=max(sheet.row_count, required_rows), 
-                cols=max(sheet.col_count, required_cols)
-            )
-            
-        sheet.clear()
-        try:
-            sheet.update(range_name="A1", values=data)
-        except TypeError:
-            sheet.update("A1", data)
-            
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-def sync_to_google_sheet(summary_df, detailed_df):
+def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges):
     spr = get_gspread_client()
     if not spr:
         return False, "Could not connect to Google Spreadsheet. Check secrets configuration."
     
-    # 1. Sync Nested Production Schedule
-    ok1, err1 = write_worksheet_safely(spr, "Production Schedule", detailed_df)
-    if not ok1:
-        return False, f"Failed updating 'Production Schedule': {err1}"
+    try:
+        # 1. Sync Production Schedule (Hierarchical with Row Grouping)
+        try:
+            sheet_details = spr.worksheet("Production Schedule")
+        except gspread.exceptions.WorksheetNotFound:
+            sheet_details = spr.add_worksheet(
+                title="Production Schedule", 
+                rows=max(len(detailed_df) + 100, 100), 
+                cols=max(len(detailed_df.columns) + 5, 15)
+            )
 
-    # 2. Sync Logo Batch Summary
-    ok2, err2 = write_worksheet_safely(spr, "Logo Batch Summary", summary_df)
-    if not ok2:
-        return False, f"Failed updating 'Logo Batch Summary': {err2}"
+        clean_detailed = detailed_df.fillna("").astype(str)
+        data_detailed = [clean_detailed.columns.tolist()] + clean_detailed.values.tolist()
+        
+        req_rows = max(len(data_detailed) + 50, 100)
+        req_cols = max(len(data_detailed[0]) + 5, 15)
+        if sheet_details.row_count < req_rows or sheet_details.col_count < req_cols:
+            sheet_details.resize(rows=max(sheet_details.row_count, req_rows), cols=max(sheet_details.col_count, req_cols))
 
-    return True, "Successfully synced both sheets to Google Sheets!"
+        sheet_details.clear()
+        try:
+            sheet_details.update(range_name="A1", values=data_detailed)
+        except TypeError:
+            sheet_details.update("A1", data_detailed)
+
+        # Clear any existing row dimension groups on Production Schedule
+        for _ in range(5):
+            try:
+                spr.batch_update({
+                    "requests": [{
+                        "deleteDimensionGroup": {
+                            "range": {
+                                "sheetId": sheet_details.id,
+                                "dimension": "ROWS",
+                                "startIndex": 0,
+                                "endIndex": sheet_details.row_count
+                            }
+                        }
+                    }]
+                })
+            except Exception:
+                break
+
+        # Apply row grouping (+ / - toggles) above the nested rows
+        group_requests = [
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_details.id,
+                        "rowGroupControlAfter": False
+                    },
+                    "fields": "rowGroupControlAfter"
+                }
+            }
+        ]
+        for start_idx, end_idx in row_group_ranges:
+            group_requests.append({
+                "addDimensionGroup": {
+                    "range": {
+                        "sheetId": sheet_details.id,
+                        "dimension": "ROWS",
+                        "startIndex": start_idx,
+                        "endIndex": end_idx
+                    }
+                }
+            })
+
+        if len(group_requests) > 1:
+            spr.batch_update({"requests": group_requests})
+
+        # 2. Sync Logo Batch Summary
+        try:
+            sheet_summary = spr.worksheet("Logo Batch Summary")
+        except gspread.exceptions.WorksheetNotFound:
+            sheet_summary = spr.add_worksheet(
+                title="Logo Batch Summary", 
+                rows=max(len(summary_df) + 100, 100), 
+                cols=max(len(summary_df.columns) + 5, 15)
+            )
+
+        clean_summary = summary_df.fillna("").astype(str)
+        data_summary = [clean_summary.columns.tolist()] + clean_summary.values.tolist()
+
+        req_rows_sum = max(len(data_summary) + 50, 100)
+        req_cols_sum = max(len(data_summary[0]) + 5, 15)
+        if sheet_summary.row_count < req_rows_sum or sheet_summary.col_count < req_cols_sum:
+            sheet_summary.resize(rows=max(sheet_summary.row_count, req_rows_sum), cols=max(sheet_summary.col_count, req_cols_sum))
+
+        sheet_summary.clear()
+        try:
+            sheet_summary.update(range_name="A1", values=data_summary)
+        except TypeError:
+            sheet_summary.update("A1", data_summary)
+
+        return True, "Successfully synced both sheets to Google Sheets with collapsible row groups!"
+    except Exception as e:
+        return False, f"Sync error: {e}"
 
 # ---------------------------------------------------------
 # AUTHENTICATION
@@ -208,150 +263,3 @@ if df is not None:
     ]
 
     # ---------------------------------------------------------
-    # LEVEL 1: LOGO BATCH SUMMARY (Sorted Oldest to Newest by Customer Order Date)
-    # ---------------------------------------------------------
-    logo_summary = df.groupby('Logo_Clean', dropna=False).agg(
-        Oldest_Order_Date=('Order_Date_Clean', 'min'),
-        Decorating_Type=('Dec_Type', 'first'),
-        Total_WOs=('WO_Clean', 'nunique'),
-        Total_Units=('Qty_Clean', 'sum'),
-        Customer_Groups=('Group_Clean', lambda s: " | ".join(sorted(set(s))))
-    ).reset_index()
-
-    logo_summary['Days_Waiting'] = (current_date - logo_summary['Oldest_Order_Date']).dt.days
-    logo_summary = logo_summary.sort_values(by='Oldest_Order_Date', ascending=True, na_position='last')
-    sorted_logos = logo_summary['Logo_Clean'].tolist()
-
-    # ---------------------------------------------------------
-    # LEVEL 2: DETAILED WORK ORDERS BY LOGO (WITHOUT INDIVIDUAL SKUs)
-    # ---------------------------------------------------------
-    def combine_unique(series):
-        vals = [clean_str(x) for x in series.dropna().unique() if clean_str(x)]
-        return " | ".join(vals) if vals else "-"
-
-    agg_dict = {
-        'Order_Date': ('Order_Date_Clean', 'min'),
-        'Customer_Group': ('Group_Clean', lambda s: " | ".join(sorted(set(s)))),
-        'Decorating_Type': ('Dec_Type', 'first'),
-        'Units': ('Qty_Clean', 'sum')
-    }
-    if notes_col:
-        agg_dict['Special_Notes'] = (notes_col, combine_unique)
-    else:
-        df['_notes_placeholder'] = "-"
-        agg_dict['Special_Notes'] = ('_notes_placeholder', 'first')
-
-    wo_detail = df.groupby(['Logo_Clean', 'WO_Clean'], dropna=False).agg(**agg_dict).reset_index()
-    wo_detail['Days_Waiting'] = (current_date - wo_detail['Order_Date']).dt.days
-
-    # ---------------------------------------------------------
-    # NESTED HIERARCHICAL PRODUCTION SCHEDULE TABLE
-    # ---------------------------------------------------------
-    nested_schedule_rows = []
-
-    for logo in sorted_logos:
-        sum_row = logo_summary[logo_summary['Logo_Clean'] == logo].iloc[0]
-        oldest_dt = sum_row['Oldest_Order_Date']
-        oldest_dt_str = oldest_dt.strftime('%m/%d/%Y') if pd.notna(oldest_dt) else "-"
-        wait_days = int(sum_row['Days_Waiting']) if pd.notna(sum_row['Days_Waiting']) else "-"
-
-        # 1. HEADER ROW FOR LOGO BATCH
-        nested_schedule_rows.append({
-            'Logo / Work Order #': f"🔷 {logo.upper()}",
-            'Decorating Type': sum_row['Decorating_Type'],
-            'Customer Group': sum_row['Customer_Groups'],
-            'Customer Order Date': oldest_dt_str,
-            'Days Waiting': wait_days,
-            'Units': int(sum_row['Total_Units']),
-            'Special Instructions / Notes': f"BATCH TOTAL: {sum_row['Total_WOs']} Work Order(s)"
-        })
-
-        # 2. NESTED WORK ORDER ROWS UNDER THIS LOGO
-        sub_wos = wo_detail[wo_detail['Logo_Clean'] == logo].sort_values(
-            by='Order_Date', ascending=True, na_position='last'
-        )
-        for _, wo_row in sub_wos.iterrows():
-            wo_dt = wo_row['Order_Date']
-            wo_dt_str = wo_dt.strftime('%m/%d/%Y') if pd.notna(wo_dt) else "-"
-            wo_wait = int(wo_row['Days_Waiting']) if pd.notna(wo_row['Days_Waiting']) else "-"
-
-            nested_schedule_rows.append({
-                'Logo / Work Order #': f"    ↳ WO #{wo_row['WO_Clean']}",
-                'Decorating Type': "",
-                'Customer Group': wo_row['Customer_Group'],
-                'Customer Order Date': wo_dt_str,
-                'Days Waiting': wo_wait,
-                'Units': int(wo_row['Units']),
-                'Special Instructions / Notes': wo_row['Special_Notes']
-            })
-
-    nested_schedule_df = pd.DataFrame(nested_schedule_rows)
-
-    # Clean Logo Summary for display and sync
-    logo_summary_display = logo_summary.copy()
-    logo_summary_display['Oldest_Order_Date'] = logo_summary_display['Oldest_Order_Date'].apply(
-        lambda d: d.strftime('%m/%d/%Y') if pd.notna(d) else "-"
-    )
-    logo_summary_display['Days_Waiting'] = logo_summary_display['Days_Waiting'].apply(
-        lambda x: int(x) if pd.notna(x) else "-"
-    )
-
-    summary_cols = ['Logo_Clean', 'Decorating_Type', 'Oldest_Order_Date', 'Days_Waiting', 'Total_WOs', 'Total_Units', 'Customer_Groups']
-    logo_summary_display = logo_summary_display[summary_cols].rename(columns={
-        'Logo_Clean': 'Logo',
-        'Decorating_Type': 'Decorating Type',
-        'Oldest_Order_Date': 'Oldest Order Date',
-        'Days_Waiting': 'Oldest Wait (Days)',
-        'Total_WOs': 'Open WOs',
-        'Total_Units': 'Total Units',
-        'Customer_Groups': 'Customer Group(s)'
-    })
-
-    # Metrics
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Garment Units", f"{df['Qty_Clean'].sum():,}")
-    m2.metric("Total Work Orders", f"{df['WO_Clean'].nunique():,}")
-    m3.metric("Distinct Logo Setups", f"{len(logo_summary):,}")
-    valid_waits = logo_summary['Days_Waiting'].dropna()
-    oldest_wait = f"{int(valid_waits.max())} Days" if not valid_waits.empty else "N/A"
-    m4.metric("Oldest Customer Wait", oldest_wait)
-
-    st.markdown("---")
-
-    col_act1, col_act2, _ = st.columns([1.5, 1.5, 3])
-
-    with col_act1:
-        if st.button("📤 Sync to Decorator Google Sheet"):
-            with st.spinner("Writing to Google Sheet..."):
-                success, msg = sync_to_google_sheet(logo_summary_display, nested_schedule_df)
-                if success:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-
-    with col_act2:
-        output_buffer = io.BytesIO()
-        with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
-            nested_schedule_df.to_excel(writer, sheet_name='Production Schedule', index=False)
-            logo_summary_display.to_excel(writer, sheet_name='Logo Batch Summary', index=False)
-        output_buffer.seek(0)
-
-        st.download_button(
-            label="📥 Download Excel (.xlsx)",
-            data=output_buffer,
-            file_name=f"Decorating_Production_Schedule_{datetime.today().strftime('%Y%m%d')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-    tab1, tab2 = st.tabs(["📋 Work Order Production Schedule (Nested)", "📊 Logo Batch Summary"])
-
-    with tab1:
-        st.caption("Header row shows Logo totals; nested rows show individual Work Orders sorted oldest to newest.")
-        st.dataframe(nested_schedule_df, use_container_width=True, hide_index=True)
-
-    with tab2:
-        st.caption("Machine setup queue for the decorating company.")
-        st.dataframe(logo_summary_display, use_container_width=True, hide_index=True)
-
-else:
-    st.info("Upload your Orders export CSV above to generate the decorating production schedule.")
