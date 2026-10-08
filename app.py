@@ -194,4 +194,14 @@ if "authenticated" not in st.session_state:
     st.session_state["authenticated"] = False
 
 if not st.session_state["authenticated"]:
-    st.title("🔒 Security
+    st.title("🔒 Security Check")
+    with st.form("login_form"):
+        user_input = st.text_input("Enter Access Key:", type="password")
+        login_submitted = st.form_submit_button("Login")
+        if login_submitted:
+            if user_input == APP_PASSWORD:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Incorrect access key. Please try again.")
+    st.stop()
