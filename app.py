@@ -6,17 +6,24 @@ import io
 import gspread
 from google.oauth2.service_account import Credentials
 import openpyxl
+from openpyxl.styles import PatternFill, Font
 
 # ---------------------------------------------------------
 # CONFIGURATION & PAGE SETUP
 # ---------------------------------------------------------
 APP_PASSWORD = "11277"
+DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/1nuarX5ygqzq5_xn7mq5JqsGuP2YzrqEZ1kx-gePq5yw/edit"
 
 st.set_page_config(
     page_title="Force Fitters - Decorating Production Schedule", 
     layout="wide", 
     initial_sidebar_state="collapsed"
 )
+
+def get_sheet_url():
+    if "gsheets" in st.secrets and "spreadsheet_url" in st.secrets["gsheets"]:
+        return st.secrets["gsheets"]["spreadsheet_url"]
+    return DEFAULT_GSHEET_URL
 
 def clean_str(val):
     if pd.isna(val) or val is None:
@@ -52,7 +59,6 @@ def extract_logo_family_key(logo_str):
     if not logo_str:
         return ""
     s = str(logo_str).strip()
-    # Standard format: logo name | color | location | type (color is at index 1)
     if '|' in s:
         parts = [p.strip().upper() for p in s.split('|')]
         if len(parts) >= 4:
@@ -61,7 +67,6 @@ def extract_logo_family_key(logo_str):
             return f"{parts[0]}||{parts[2]}"
         elif len(parts) == 2:
             return parts[0]
-    # Fallback delimiter: ' - '
     if ' - ' in s:
         parts = [p.strip().upper() for p in s.split(' - ')]
         if len(parts) >= 4:
@@ -87,7 +92,7 @@ def get_gspread_client():
                 st.secrets["gcp_service_account"], scopes=scopes
             )
             client = gspread.authorize(creds)
-            spreadsheet = client.open_by_url(st.secrets["gsheets"]["spreadsheet_url"])
+            spreadsheet = client.open_by_url(get_sheet_url())
             return spreadsheet
         except Exception as e:
             st.error(f"Google Sheets Connection Error: {e}")
@@ -96,7 +101,7 @@ def get_gspread_client():
         st.error("Streamlit Secrets missing [gcp_service_account] or [gsheets]. Please check Settings > Secrets.")
         return None
 
-def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges):
+def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges, logo_header_indices):
     spr = get_gspread_client()
     if not spr:
         return False, "Could not connect to Google Spreadsheet. Check secrets configuration."
@@ -150,7 +155,7 @@ def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges):
         except TypeError:
             sheet_summary.update("A1", data_summary)
 
-        # 3. Apply Google Sheets Collapsible Row Grouping
+        # 3. Apply Google Sheets Collapsible Row Grouping & Color Formatting
         try:
             meta = spr.fetch_sheet_metadata()
             existing_row_groups = []
@@ -166,9 +171,9 @@ def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges):
                 ]
                 spr.batch_update({"requests": delete_reqs})
 
-            # Configure [+] toggle to sit on top (on the Logo Header row)
-            spr.batch_update({
-                "requests": [{
+            batch_requests = [
+                # [+] Toggle on Logo header row
+                {
                     "updateSheetProperties": {
                         "properties": {
                             "sheetId": sheet_details.id,
@@ -178,13 +183,72 @@ def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges):
                         },
                         "fields": "gridProperties.rowGroupControlAfter"
                     }
-                }]
-            })
+                },
+                # Production Schedule: Top row (labels) Light Blue (#CFE2F3)
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_details.id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(detailed_df.columns)
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {"red": 0.81, "green": 0.89, "blue": 0.95},
+                                "textFormat": {"bold": True}
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                    }
+                },
+                # Logo Batch Summary: Top row (labels) Light Blue (#CFE2F3)
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_summary.id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(summary_df.columns)
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {"red": 0.81, "green": 0.89, "blue": 0.95},
+                                "textFormat": {"bold": True}
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                    }
+                }
+            ]
 
-            # Add row groups for each Logo's nested Work Orders
+            # Production Schedule: Logo Header Rows Light Green (#E2EFDA)
+            for h_idx in logo_header_indices:
+                batch_requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_details.id,
+                            "startRowIndex": h_idx,
+                            "endRowIndex": h_idx + 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": len(detailed_df.columns)
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {"red": 0.88, "green": 0.94, "blue": 0.85},
+                                "textFormat": {"bold": True}
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)"
+                    }
+                })
+
+            # Add collapsible row groups for nested Work Orders
             if row_group_ranges:
-                add_group_requests = [
-                    {
+                for start_idx, end_idx in row_group_ranges:
+                    batch_requests.append({
                         "addDimensionGroup": {
                             "range": {
                                 "sheetId": sheet_details.id,
@@ -193,14 +257,13 @@ def sync_to_google_sheet(summary_df, detailed_df, row_group_ranges):
                                 "endIndex": end_idx
                             }
                         }
-                    }
-                    for start_idx, end_idx in row_group_ranges
-                ]
-                spr.batch_update({"requests": add_group_requests})
+                    })
+
+            spr.batch_update({"requests": batch_requests})
         except Exception:
             pass
 
-        return True, "Successfully synced both sheets to Google Sheets with collapsible row groups!"
+        return True, "Successfully synced both sheets to Google Sheets with custom color formatting and collapsible groups!"
     except Exception as e:
         return False, f"Sync error: {e}"
 
@@ -226,8 +289,16 @@ if not st.session_state["authenticated"]:
 # ---------------------------------------------------------
 # MAIN APP HEADER & FILE UPLOADER
 # ---------------------------------------------------------
-st.title("FORCE FITTERS | Decorating Production Schedule")
-st.caption("Organized for shop-floor production by Logo, Thread/Ink Color Family, and Customer Order Date.")
+sheet_link = get_sheet_url()
+
+col_title, col_link = st.columns([3, 1])
+with col_title:
+    st.title("FORCE FITTERS | Decorating Production Schedule")
+    st.caption("Organized for shop-floor production by Logo, Thread/Ink Color Family, and Customer Order Date.")
+with col_link:
+    st.markdown("<div style='text-align: right; padding-top: 25px;'>", unsafe_allow_html=True)
+    st.link_button("🌐 Open Google Sheet", sheet_link)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 uploaded_file = st.file_uploader(
     "Upload Force Fitters Orders Export (CSV format):", 
@@ -303,16 +374,13 @@ if df is not None:
             return existing_logo
         
         grp = row['Group_Clean']
-        # Check exact customer group match
         if grp in group_to_logo and group_to_logo[grp]:
             return group_to_logo[grp]
         
-        # Check company root match (e.g. CASEYS TRANS... matches CASEYS)
         rw = get_root_word(grp)
         if rw and rw in prefix_to_logo and prefix_to_logo[rw]:
             return prefix_to_logo[rw]
         
-        # Fallback if no matching group has an assigned logo
         return f"Unassigned Logo ({grp})" if grp != "Unassigned Group" else "Unassigned Logo"
 
     df['Logo_Clean'] = df.apply(resolve_logo, axis=1)
@@ -338,8 +406,6 @@ if df is not None:
 
     logo_summary['Days_Waiting'] = (current_date - logo_summary['Oldest_Order_Date']).dt.days
 
-    # Thread/Ink Color Family Grouping:
-    # If logos share name, location, and type, move alternate colors directly below highest ranking color!
     logo_summary['Family_Key'] = logo_summary['Logo_Clean'].apply(extract_logo_family_key)
     family_min_date = logo_summary.groupby('Family_Key')['Oldest_Order_Date'].min().to_dict()
     logo_summary['Family_Rank_Date'] = logo_summary['Family_Key'].map(family_min_date)
@@ -380,7 +446,9 @@ if df is not None:
     # ---------------------------------------------------------
     nested_schedule_rows = []
     row_group_ranges = []
+    logo_header_indices = []
     excel_sub_row_indices = []
+    excel_logo_row_indices = []
 
     current_sheet_row_idx = 1 # Index 0 is the table header row (Row 1 in Sheets)
 
@@ -402,6 +470,8 @@ if df is not None:
             'Units': int(sum_row['Total_Units']),
             'Special Instructions / Notes': f"BATCH TOTAL: {sum_row['Total_WOs']} Work Order(s)"
         })
+        logo_header_indices.append(current_sheet_row_idx)
+        excel_logo_row_indices.append(current_sheet_row_idx + 1)
         current_sheet_row_idx += 1
 
         # 2. NESTED WORK ORDER ROWS
@@ -468,14 +538,16 @@ if df is not None:
 
     st.markdown("---")
 
-    col_act1, col_act2, _ = st.columns([1.5, 1.5, 3])
+    # Action buttons
+    col_act1, col_act2, col_act3, _ = st.columns([1.6, 1.4, 1.5, 1.5])
 
     with col_act1:
         if st.button("📤 Sync to Decorator Google Sheet"):
-            with st.spinner("Writing to Google Sheet & setting up collapsible row groups..."):
-                success, msg = sync_to_google_sheet(logo_summary_display, nested_schedule_df, row_group_ranges)
+            with st.spinner("Writing to Google Sheet & setting up styling and row groups..."):
+                success, msg = sync_to_google_sheet(logo_summary_display, nested_schedule_df, row_group_ranges, logo_header_indices)
                 if success:
                     st.success(msg)
+                    st.markdown(f"👉 [**Open Google Sheet directly**]({sheet_link})")
                 else:
                     st.error(msg)
 
@@ -483,19 +555,40 @@ if df is not None:
         output_buffer = io.BytesIO()
         wb = openpyxl.Workbook()
         
-        # Sheet 1: Production Schedule (with collapsible outline grouping)
+        blue_fill = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
+        green_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        bold_font = Font(bold=True)
+
+        # Sheet 1: Production Schedule (Styled + Collapsible Outlines)
         ws1 = wb.active
         ws1.title = 'Production Schedule'
         ws1.sheet_properties.outlinePr.summaryBelow = False
         ws1.append(nested_schedule_df.columns.tolist())
+        for col_i in range(1, len(nested_schedule_df.columns) + 1):
+            cell = ws1.cell(row=1, column=col_i)
+            cell.fill = blue_fill
+            cell.font = bold_font
+
         for r_val in nested_schedule_df.values.tolist():
             ws1.append(r_val)
+
+        for logo_r in excel_logo_row_indices:
+            for col_i in range(1, len(nested_schedule_df.columns) + 1):
+                cell = ws1.cell(row=logo_r, column=col_i)
+                cell.fill = green_fill
+                cell.font = bold_font
+
         for sub_r in excel_sub_row_indices:
             ws1.row_dimensions[sub_r].outlineLevel = 1
 
-        # Sheet 2: Logo Batch Summary
+        # Sheet 2: Logo Batch Summary (Styled Headers)
         ws2 = wb.create_sheet(title='Logo Batch Summary')
         ws2.append(logo_summary_display.columns.tolist())
+        for col_i in range(1, len(logo_summary_display.columns) + 1):
+            cell = ws2.cell(row=1, column=col_i)
+            cell.fill = blue_fill
+            cell.font = bold_font
+
         for r_val in logo_summary_display.values.tolist():
             ws2.append(r_val)
 
@@ -508,6 +601,9 @@ if df is not None:
             file_name=f"Decorating_Production_Schedule_{datetime.today().strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+
+    with col_act3:
+        st.link_button("🔗 Open Decorator Google Sheet", sheet_link)
 
     tab1, tab2 = st.tabs(["📋 Work Order Production Schedule (Nested)", "📊 Logo Batch Summary"])
 
