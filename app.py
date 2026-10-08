@@ -48,6 +48,30 @@ def find_column(df_columns, candidate_names):
                 return col
     return None
 
+def extract_logo_family_key(logo_str):
+    if not logo_str:
+        return ""
+    s = str(logo_str).strip()
+    # Standard format: logo name | color | location | type (color is at index 1)
+    if '|' in s:
+        parts = [p.strip().upper() for p in s.split('|')]
+        if len(parts) >= 4:
+            return f"{parts[0]}||{'||'.join(parts[2:])}"
+        elif len(parts) == 3:
+            return f"{parts[0]}||{parts[2]}"
+        elif len(parts) == 2:
+            return parts[0]
+    # Fallback delimiter: ' - '
+    if ' - ' in s:
+        parts = [p.strip().upper() for p in s.split(' - ')]
+        if len(parts) >= 4:
+            return f"{parts[0]}||{'||'.join(parts[2:])}"
+        elif len(parts) == 3:
+            return f"{parts[0]}||{parts[2]}"
+        elif len(parts) == 2:
+            return parts[0]
+    return s.upper()
+
 # ---------------------------------------------------------
 # GOOGLE SHEETS CONNECTION & SYNC HELPERS
 # ---------------------------------------------------------
@@ -203,7 +227,7 @@ if not st.session_state["authenticated"]:
 # MAIN APP HEADER & FILE UPLOADER
 # ---------------------------------------------------------
 st.title("FORCE FITTERS | Decorating Production Schedule")
-st.caption("Organized for shop-floor production by Logo and Customer Order Date.")
+st.caption("Organized for shop-floor production by Logo, Thread/Ink Color Family, and Customer Order Date.")
 
 uploaded_file = st.file_uploader(
     "Upload Force Fitters Orders Export (CSV format):", 
@@ -244,11 +268,55 @@ if df is not None:
 
     df['WO_Clean'] = df[wo_col].apply(clean_str).replace("", "No WO Number") if wo_col else "No WO Number"
     df['WO_Date_Clean'] = pd.to_datetime(df[wo_date_col], errors='coerce') if wo_date_col else pd.NaT
-    df['Logo_Clean'] = df[logo_col].apply(clean_str).replace("", "Unassigned Logo") if logo_col else "Unassigned Logo"
+    df['Logo_Clean'] = df[logo_col].apply(clean_str) if logo_col else ""
     df['Group_Clean'] = df[group_col].apply(clean_str).replace("", "Unassigned Group") if group_col else "Unassigned Group"
     df['Order_Date_Clean'] = pd.to_datetime(df[order_date_col], errors='coerce') if order_date_col else pd.NaT
     df['Qty_Clean'] = pd.to_numeric(df[qty_col], errors='coerce').fillna(0).astype(int) if qty_col else 1
-    
+
+    # ---------------------------------------------------------
+    # INTELLIGENT LOGO INFERENCE FOR BLANK LOGOS
+    # ---------------------------------------------------------
+    valid_logo_rows = df[df['Logo_Clean'] != ""]
+    group_to_logo = {}
+    if not valid_logo_rows.empty:
+        group_to_logo = valid_logo_rows.groupby('Group_Clean')['Logo_Clean'].agg(
+            lambda s: s.mode().iloc[0] if not s.empty else ""
+        ).to_dict()
+
+    def get_root_word(g):
+        words = re.findall(r'[A-Za-z0-9]+', str(g).upper())
+        ignore_words = {"THE", "A", "AN", "CITY", "OF", "UNASSIGNED", "TOWN", "STATE"}
+        for w in words:
+            if w not in ignore_words and len(w) > 2:
+                return w
+        return words[0] if words else ""
+
+    prefix_to_logo = {}
+    for g, l in group_to_logo.items():
+        rw = get_root_word(g)
+        if rw:
+            prefix_to_logo[rw] = l
+
+    def resolve_logo(row):
+        existing_logo = row['Logo_Clean']
+        if existing_logo:
+            return existing_logo
+        
+        grp = row['Group_Clean']
+        # Check exact customer group match
+        if grp in group_to_logo and group_to_logo[grp]:
+            return group_to_logo[grp]
+        
+        # Check company root match (e.g. CASEYS TRANS... matches CASEYS)
+        rw = get_root_word(grp)
+        if rw and rw in prefix_to_logo and prefix_to_logo[rw]:
+            return prefix_to_logo[rw]
+        
+        # Fallback if no matching group has an assigned logo
+        return f"Unassigned Logo ({grp})" if grp != "Unassigned Group" else "Unassigned Logo"
+
+    df['Logo_Clean'] = df.apply(resolve_logo, axis=1)
+
     notes_series = df[notes_col].apply(clean_str) if notes_col else pd.Series([""] * len(df))
     sku_series = df[sku_col].apply(clean_str) if sku_col else pd.Series([""] * len(df))
 
@@ -258,7 +326,7 @@ if df is not None:
     ]
 
     # ---------------------------------------------------------
-    # LEVEL 1: LOGO BATCH SUMMARY (Sorted Oldest to Newest by Customer Order Date)
+    # LEVEL 1: LOGO BATCH SUMMARY (Grouped by Color Family, Sorted by Oldest Date)
     # ---------------------------------------------------------
     logo_summary = df.groupby('Logo_Clean', dropna=False).agg(
         Oldest_Order_Date=('Order_Date_Clean', 'min'),
@@ -269,7 +337,19 @@ if df is not None:
     ).reset_index()
 
     logo_summary['Days_Waiting'] = (current_date - logo_summary['Oldest_Order_Date']).dt.days
-    logo_summary = logo_summary.sort_values(by='Oldest_Order_Date', ascending=True, na_position='last')
+
+    # Thread/Ink Color Family Grouping:
+    # If logos share name, location, and type, move alternate colors directly below highest ranking color!
+    logo_summary['Family_Key'] = logo_summary['Logo_Clean'].apply(extract_logo_family_key)
+    family_min_date = logo_summary.groupby('Family_Key')['Oldest_Order_Date'].min().to_dict()
+    logo_summary['Family_Rank_Date'] = logo_summary['Family_Key'].map(family_min_date)
+
+    logo_summary = logo_summary.sort_values(
+        by=['Family_Rank_Date', 'Oldest_Order_Date'],
+        ascending=[True, True],
+        na_position='last'
+    ).drop(columns=['Family_Key', 'Family_Rank_Date'])
+
     sorted_logos = logo_summary['Logo_Clean'].tolist()
 
     # ---------------------------------------------------------
@@ -432,7 +512,7 @@ if df is not None:
     tab1, tab2 = st.tabs(["📋 Work Order Production Schedule (Nested)", "📊 Logo Batch Summary"])
 
     with tab1:
-        st.caption("Separate Logo, Work Order #, and WO Date columns. On Google Sheets / Excel, click [+] on the left margin to expand sub-rows.")
+        st.caption("Separate Logo, Work Order #, and WO Date columns. Grouped by design & thread color family. On Google Sheets / Excel, click [+] on the left margin to expand sub-rows.")
         st.dataframe(nested_schedule_df, hide_index=True)
 
     with tab2:
